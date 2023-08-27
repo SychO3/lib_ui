@@ -210,6 +210,7 @@ struct QuotePaintCache {
 	std::array<QColor, kMaxQuoteOutlines> outlines;
 	QColor header;
 	QColor bg;
+	QColor bg2;
 	QColor icon;
 };
 
