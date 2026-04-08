@@ -168,7 +168,7 @@ public:
 
 private:
 	EntityType _type = EntityType::Invalid;
-	bool _local;
+	bool _local = false;
 	int _offset = 0;
 	int _length = 0;
 	QString _data;
