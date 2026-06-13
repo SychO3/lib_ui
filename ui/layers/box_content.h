@@ -72,6 +72,8 @@ public:
 		Text::MarkedContext context = {}) = 0;
 	virtual void setAdditionalTitle(rpl::producer<QString> additional) = 0;
 	virtual void setCloseByOutsideClick(bool close) = 0;
+	[[nodiscard]] virtual rpl::producer<int> layerHeightMaxValue() = 0;
+	[[nodiscard]] virtual rpl::producer<int> contentHeightMaxValue() = 0;
 
 	virtual void setCustomCornersFilling(RectParts corners) = 0;
 	virtual void clearButtons() = 0;
@@ -137,6 +139,9 @@ public:
 	void setCloseByEscape(bool close) {
 		_closeByEscape = close;
 	}
+	[[nodiscard]] bool closeByEscape() const {
+		return _closeByEscape;
+	}
 	void setCloseByOutsideClick(bool close) {
 		getDelegate()->setCloseByOutsideClick(close);
 	}
@@ -144,6 +149,12 @@ public:
 	void scrollToWidget(not_null<QWidget*> widget);
 
 	virtual void showFinished() {
+	}
+	[[nodiscard]] virtual crl::time layerAnimationDuration() const {
+		return _layerAnimationDuration;
+	}
+	void setLayerAnimationDuration(crl::time duration) {
+		_layerAnimationDuration = duration;
 	}
 	void setCustomCornersFilling(RectParts corners) {
 		getDelegate()->setCustomCornersFilling(corners);
@@ -323,6 +334,8 @@ private:
 	Ui::Animations::Simple _scrollAnimation;
 
 	rpl::event_stream<> _boxClosingStream;
+
+	crl::time _layerAnimationDuration = 0;
 
 };
 
