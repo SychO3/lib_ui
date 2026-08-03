@@ -10,7 +10,6 @@
 #include "base/qt_signal_producer.h"
 #include "base/qt/qt_common_adapters.h"
 #include "base/invoke_queued.h"
-#include "base/qthelp_regex.h"
 #include "base/random.h"
 #include "ui/platform/ui_platform_utility.h"
 #include "emoji_suggestions_helper.h"
@@ -466,9 +465,12 @@ void TrimFullCoverageTags(TextWithTags &parsed) {
 		return link.toString();
 	}
 	const auto index = link.indexOf('?');
-	return u"%1?%2"_q
-		.arg((index < 0) ? link : base::StringViewMid(link, 0, index))
-		.arg(++GlobalCustomEmojiCounter);
+	const auto data = (index < 0)
+		? link
+		: base::StringViewMid(link, 0, index);
+	return data.toString()
+		+ u"?"_q
+		+ QString::number(++GlobalCustomEmojiCounter);
 }
 
 [[nodiscard]] QString DefaultTagMimeProcessor(QStringView mimeTag) {
@@ -477,13 +479,7 @@ void TrimFullCoverageTags(TextWithTags &parsed) {
 }
 
 [[nodiscard]] uint64 CustomEmojiIdFromLink(QStringView link) {
-	const auto skip = InputField::kCustomEmojiTagStart.size();
-	const auto index = link.indexOf('?', skip + 1);
-	return base::StringViewMid(
-		link,
-		skip,
-		(index <= skip) ? -1 : (index - skip)
-	).toULongLong();
+	return InputField::CustomEmojiEntityData(link).toULongLong();
 }
 
 [[nodiscard]] QString CheckFullTextTag(
@@ -509,9 +505,6 @@ void TrimFullCoverageTags(TextWithTags &parsed) {
 		}
 		auto found = false;
 		for (const auto &single : TextUtilities::SplitTags(existing.id)) {
-			const auto normalized = IsTagPre(single)
-				? QStringView(kTagCode)
-				: single;
 			if (checkingLink
 				&& IsEditableLinkTag(single, instantViewEditorTagsEnabled)) {
 				if (resultLink.isEmpty()) {
@@ -523,9 +516,20 @@ void TrimFullCoverageTags(TextWithTags &parsed) {
 					break;
 				}
 				return QString();
-			} else if (!checkingLink && QStringView(tag) == normalized) {
-				found = true;
-				break;
+			} else if (!checkingLink) {
+				const auto matches = [&] {
+					if (tag == kTagPre) {
+						return IsTagPre(single);
+					}
+					const auto normalized = IsTagPre(single)
+						? QStringView(kTagCode)
+						: single;
+					return QStringView(tag) == normalized;
+				}();
+				if (matches) {
+					found = true;
+					break;
+				}
 			}
 		}
 		if (!found) {
@@ -1061,17 +1065,20 @@ QString AccumulateText(Iterator begin, Iterator end) {
 	return result;
 }
 
-QTextImageFormat PrepareEmojiFormat(EmojiPtr emoji, int lineHeight) {
+QTextImageFormat PrepareEmojiFormat(EmojiPtr emoji, int emojiHeight) {
 	const auto factor = style::DevicePixelRatio();
-	const auto size = Emoji::GetSizeNormal();
-	const auto width = size + st::emojiPadding * factor * 2;
-	const auto height = std::max(lineHeight * factor, size);
+	const auto size = std::max(emojiHeight * factor, Emoji::GetSizeNormal());
+	const auto width = Emoji::GetSizeNormal() + st::emojiPadding * factor * 2;
 	auto result = QTextImageFormat();
 	result.setWidth(width / factor);
-	result.setHeight(height / factor);
+	result.setHeight(size / factor);
 	result.setName(emoji->toUrl());
 	result.setVerticalAlignment(QTextCharFormat::AlignTop);
 	return result;
+}
+
+QTextImageFormat PrepareEmojiFormat(EmojiPtr emoji, style::font font) {
+	return PrepareEmojiFormat(emoji, font->height);
 }
 
 [[nodiscard]] QTextCharFormat PrepareTagFormat(
@@ -1668,11 +1675,7 @@ private:
 
 void InsertEmojiAtCursor(QTextCursor cursor, EmojiPtr emoji) {
 	const auto currentFormat = cursor.charFormat();
-	const auto blockFormat = cursor.blockFormat();
-	const auto type = blockFormat.lineHeightType();
-	const auto height = (type == QTextBlockFormat::FixedHeight)
-		? blockFormat.lineHeight()
-		: QFontMetrics(cursor.charFormat().font()).height();
+	const auto height = QFontMetrics(currentFormat.font()).height();
 	auto format = PrepareEmojiFormat(emoji, height);
 	ApplyTagFormat(format, currentFormat);
 	format.setVerticalAlignment(QTextCharFormat::AlignTop);
@@ -1772,6 +1775,11 @@ bool MarkdownEnabledState::enabledForTag(QStringView tag) const {
 	const auto yes = std::get_if<MarkdownEnabled>(&data);
 	return yes
 		&& (yes->tagsSubset.empty() || yes->tagsSubset.contains(tag));
+}
+
+bool MarkdownEnabledState::typedTagsEnabled() const {
+	const auto yes = std::get_if<MarkdownEnabled>(&data);
+	return yes && yes->typedTags;
 }
 
 InputField::InputField(
@@ -2138,17 +2146,8 @@ void InputField::updatePalette() {
 	}
 }
 
-void InputField::setExtendedContextMenu(
-		rpl::producer<ExtendedContextMenu> value) {
-	std::move(
-		value
-	) | rpl::on_next([=](auto pair) {
-		auto &[menu, e, setupPopupMenu] = pair;
-		contextMenuEventInner(
-			e.get(),
-			std::move(menu),
-			std::move(setupPopupMenu));
-	}, lifetime());
+void InputField::addContextMenuHook(ContextMenuHook hook) {
+	_contextMenuHooks.push_back(std::move(hook));
 }
 
 void InputField::setInstantReplaces(const InstantReplaces &replaces) {
@@ -2184,7 +2183,7 @@ void InputField::setMarkdownReplacesEnabled(
 	) | rpl::on_next([=](MarkdownEnabledState state) {
 		if (_markdownEnabledState != state) {
 			_markdownEnabledState = state;
-			if (_markdownEnabledState.disabled()) {
+			if (!_markdownEnabledState.typedTagsEnabled()) {
 				_lastMarkdownTags = {};
 			} else {
 				handleContentsChanged();
@@ -3269,9 +3268,14 @@ QString InputField::getTextPart(
 						}
 						result.append(collapsed.text);
 					} else {
-						adjustedLength += emojiText.size() - 1;
-						if (!emojiText.isEmpty()) {
-							result.append(emojiText);
+						const auto replacement = !emojiText.isEmpty()
+							? emojiText
+							: (format.objectType() == kCustomEmojiFormat)
+							? kObjectReplacement
+							: QString();
+						adjustedLength += replacement.size() - 1;
+						if (!replacement.isEmpty()) {
+							result.append(replacement);
 						}
 					}
 					begin = ch + 1;
@@ -3872,7 +3876,9 @@ void InputField::handleContentsChanged() {
 		-1,
 		_lastTextWithTags.tags,
 		tagsChanged,
-		_markdownEnabledState.disabled() ? nullptr : &_lastMarkdownTags);
+		(_markdownEnabledState.typedTagsEnabled()
+			? &_lastMarkdownTags
+			: nullptr));
 
 	//highlightMarkdown();
 	if (_spoilerRangesText.empty() && _spoilerRangesEmoji.empty()) {
@@ -4092,7 +4098,8 @@ TextWithTags InputField::getTextWithTagsPart(int start, int end) const {
 }
 
 TextWithTags InputField::getTextWithAppliedMarkdown() const {
-	if (_markdownEnabledState.disabled() || _lastMarkdownTags.empty()) {
+	if (!_markdownEnabledState.typedTagsEnabled()
+		|| _lastMarkdownTags.empty()) {
 		return getTextWithTags();
 	}
 	const auto &originalText = _lastTextWithTags.text;
@@ -4611,6 +4618,97 @@ auto InputField::editLinkSelection(QContextMenuEvent *e) const
 	};
 }
 
+InputFieldTextRange InputField::selectionEditMarkdownTagRange(
+		InputFieldTextRange selection,
+		const QString &tag) const {
+	if (tag.isEmpty() || !selection.empty()) {
+		return selection;
+	}
+	const auto position = (selection.from > 0)
+		? (selection.from - 1)
+		: selection.from;
+
+	struct State {
+		QTextBlock block;
+		QTextBlock::iterator i;
+	};
+	const auto document = _inner->document();
+	const auto skipInvalid = [&](State &state) {
+		if (state.block == document->end()) {
+			return false;
+		}
+		while (state.i.atEnd()) {
+			state.block = state.block.next();
+			if (state.block == document->end()) {
+				return false;
+			}
+			state.i = state.block.begin();
+		}
+		return true;
+	};
+	const auto moveToNext = [&](State &state) {
+		Expects(state.block != document->end());
+		Expects(!state.i.atEnd());
+
+		++state.i;
+	};
+	const auto moveToPrevious = [&](State &state) {
+		Expects(state.block != document->end());
+		Expects(!state.i.atEnd());
+
+		while (state.i == state.block.begin()) {
+			if (state.block == document->begin()) {
+				state.block = document->end();
+				return false;
+			}
+			state.block = state.block.previous();
+			state.i = state.block.end();
+		}
+		--state.i;
+		return true;
+	};
+	const auto stateTagHasMatch = [&](const State &state) {
+		const auto format = state.i.fragment().charFormat();
+		return TextUtilities::SplitTags(
+			format.property(kTagProperty).toString()).contains(tag);
+	};
+	const auto stateStart = [&](const State &state) {
+		return state.i.fragment().position();
+	};
+	const auto stateEnd = [&](const State &state) {
+		const auto fragment = state.i.fragment();
+		return fragment.position() + fragment.length();
+	};
+	auto state = State{ document->findBlock(position) };
+	if (state.block != document->end()) {
+		state.i = state.block.begin();
+	}
+	for (; skipInvalid(state); moveToNext(state)) {
+		const auto fragmentStart = stateStart(state);
+		const auto fragmentEnd = stateEnd(state);
+		if (fragmentEnd <= position) {
+			continue;
+		} else if (fragmentStart > position) {
+			break;
+		}
+		if (stateTagHasMatch(state)) {
+			auto from = fragmentStart;
+			auto till = fragmentEnd;
+			auto copy = state;
+			while (moveToPrevious(copy) && stateTagHasMatch(copy)) {
+				from = stateStart(copy);
+			}
+			while (skipInvalid(state) && stateTagHasMatch(state)) {
+				till = stateEnd(state);
+				moveToNext(state);
+			}
+			return { from, till };
+		}
+		break;
+	}
+	return selection;
+}
+
 TextWithTags InputField::prepareTextStrippingLinks(
 		EditLinkSelection selection,
 		EditLinkData *outData) {
@@ -4670,6 +4768,16 @@ void InputField::inputMethodEventInner(QInputMethodEvent *e) {
 	}
 	if (!e->commitString().isEmpty()) {
 		if (Emoji::Find(e->commitString(), nullptr)) {
+			// Finalize the active IME composition in the underlying QTextEdit.
+			// See https://github.com/telegramdesktop/tdesktop/issues/29806
+			auto clear = QInputMethodEvent();
+			_inner->QTextEdit::inputMethodEvent(&clear);
+
+			if (!_lastPreEditText.isEmpty()) {
+				_lastPreEditText = QString();
+				startPlaceholderAnimation();
+			}
+
 			auto mimeData = QMimeData();
 			mimeData.setText(e->commitString());
 			InputField::insertFromMimeDataInner(&mimeData);
@@ -5254,16 +5362,18 @@ bool InputField::IsInstantViewAnchorLink(QStringView link) {
 }
 
 QString InputField::CustomEmojiLink(QStringView entityData) {
-	return MakeUniqueCustomEmojiLink(u"%1%2"_q
-		.arg(kCustomEmojiTagStart)
-		.arg(entityData));
+	return MakeUniqueCustomEmojiLink(
+		kCustomEmojiTagStart + entityData.toString());
 }
 
 QString InputField::CustomEmojiEntityData(QStringView link) {
-	const auto match = qthelp::regex_match(
-		"^(\\d+)(\\?|$)",
-		base::StringViewMid(link, kCustomEmojiTagStart.size()));
-	return match ? match->captured(1) : QString();
+	if (!link.startsWith(kCustomEmojiTagStart)) {
+		return QString();
+	}
+	const auto skip = kCustomEmojiTagStart.size();
+	const auto index = link.indexOf('?', skip);
+	const auto length = (index < 0) ? -1 : (index - skip);
+	return base::StringViewMid(link, skip, length).toString();
 }
 
 void InputField::commitMarkdownLinkEdit(
@@ -5337,6 +5447,171 @@ void InputField::commitMarkdownLinkEdit(
 	_correcting = false;
 }
 
+void InputField::commitMarkdownTagEdit(
+		InputFieldTextRange range,
+		const QString &tag,
+		const QString &text) {
+	if (tag.isEmpty() || text.isEmpty()) {
+		return;
+	}
+	_reverseMarkdownReplacement = false;
+	_insertedTagsAreFromMime = false;
+	finishMarkdownTagChange(TextRange{
+		range.from,
+		range.till,
+	}, PrepareForInsert(TextWithTags{
+		.text = text,
+		.tags = { TextWithTags::Tag{
+			.offset = 0,
+			.length = int(text.size()),
+			.id = tag,
+		} },
+	}));
+}
+
+bool InputField::isMarkdownTagActive(const QString &tag) const {
+	if (tag.isEmpty()) {
+		return false;
+	}
+	const auto cursor = textCursor();
+	if (cursor.hasSelection()) {
+		return HasFullTextTag(getTextWithTagsSelected(), tag);
+	}
+	return TextUtilities::SplitTags(TagWithoutCustomEmoji(
+		cursor.charFormat().property(kTagProperty).toString())).contains(tag);
+}
+
+QString InputField::selectionMarkdownTagForToggle(const QString &tag) const {
+	const auto cursor = textCursor();
+	auto from = cursor.selectionStart();
+	auto till = cursor.selectionEnd();
+	if (from >= till) {
+		return QString();
+	}
+	if (document()->characterAt(from) == kHardLine) {
+		++from;
+	}
+	if (document()->characterAt(till - 1) == kHardLine) {
+		--till;
+	}
+	if (from >= till) {
+		return QString();
+	}
+	if (tag != kTagCode) {
+		return tag;
+	}
+	const auto leftForBlock = [&] {
+		if (from <= 0) {
+			return true;
+		}
+		const auto text = getTextWithTagsPart(
+			from - 1,
+			from + 1
+		).text;
+		return text.isEmpty()
+			|| IsNewline(text[0])
+			|| IsNewline(text[text.size() - 1]);
+	}();
+	const auto rightForBlock = [&] {
+		auto cursor = textCursor();
+		cursor.movePosition(QTextCursor::End);
+		if (till >= cursor.position()) {
+			return true;
+		}
+		const auto text = getTextWithTagsPart(
+			till - 1,
+			till + 1
+		).text;
+		return text.isEmpty()
+			|| IsNewline(text[0])
+			|| IsNewline(text[text.size() - 1]);
+	}();
+	const auto singleLine = [&] {
+		for (auto position = from; position != till; ++position) {
+			if (IsNewline(document()->characterAt(position))) {
+				return false;
+			}
+		}
+		return true;
+	};
+	return (leftForBlock && rightForBlock && !singleLine())
+		? kTagPre
+		: kTagCode;
+}
+
+void InputField::toggleCurrentMarkdownTag(const QString &tag) {
+	if (tag.isEmpty()) {
+		return;
+	}
+	_reverseMarkdownReplacement = false;
+	_insertedTagsAreFromMime = false;
+	const auto cursor = textCursor();
+	if (cursor.hasSelection()) {
+		toggleSelectionMarkdown(tag);
+		Integration::Instance().textActionsUpdated();
+		return;
+	}
+	const auto currentTag = TagWithoutCustomEmoji(
+		cursor.charFormat().property(kTagProperty).toString());
+	const auto updatedTag = isMarkdownTagActive(tag)
+		? TextUtilities::TagWithRemoved(currentTag, tag)
+		: TagWithAddedDroppingMath(
+			currentTag,
+			tag,
+			_instantViewEditorTagsEnabled);
+	auto format = _defaultCharFormat;
+	format.merge(PrepareTagFormat(
+		_st,
+		updatedTag,
+		_instantViewEditorTagsEnabled));
+	_defaultCharFormat = format;
+	auto updatedCursor = cursor;
+	updatedCursor.setCharFormat(format);
+	setTextCursor(updatedCursor);
+	Integration::Instance().textActionsUpdated();
+}
+
+void InputField::clearCurrentMarkdown() {
+	_reverseMarkdownReplacement = false;
+	_insertedTagsAreFromMime = false;
+	const auto cursor = textCursor();
+	if (cursor.hasSelection()) {
+		clearSelectionMarkdown();
+		Integration::Instance().textActionsUpdated();
+		return;
+	}
+	auto format = _defaultCharFormat;
+	format.merge(PrepareTagFormat(
+		_st,
+		QString(),
+		_instantViewEditorTagsEnabled));
+	_defaultCharFormat = format;
+	auto updatedCursor = cursor;
+	updatedCursor.setCharFormat(format);
+	setTextCursor(updatedCursor);
+	Integration::Instance().textActionsUpdated();
+}
+
+bool InputField::hasCurrentMarkdownLink() const {
+	if (!_editLinkCallback) {
+		return false;
+	}
+	const auto cursor = textCursor();
+	const auto selection = EditLinkSelection{
+		.from = cursor.selectionStart(),
+		.till = cursor.selectionEnd(),
+	};
+	return !selectionEditLinkData(selection).link.isEmpty();
+}
+
+void InputField::editCurrentMarkdownLink() {
+	const auto cursor = textCursor();
+	editMarkdownLink({
+		cursor.selectionStart(),
+		cursor.selectionEnd(),
+	});
+}
+
 void InputField::toggleSelectionMarkdown(const QString &tag) {
 	_reverseMarkdownReplacement = false;
 	_insertedTagsAreFromMime = false;
@@ -5356,42 +5631,15 @@ void InputField::toggleSelectionMarkdown(const QString &tag) {
 	auto range = TextRange{ from, till };
 	if (tag.isEmpty()) {
 		RemoveDocumentTags(_st, document(), from, till);
-	} else if (HasFullTextTag(getTextWithTagsSelected(), tag)) {
-		removeMarkdownTag(range, tag);
 	} else {
-		const auto leftForBlock = [&] {
-			if (from <= 0) {
-				return true;
-			}
-			const auto text = getTextWithTagsPart(
-				from - 1,
-				from + 1
-			).text;
-			return text.isEmpty()
-				|| IsNewline(text[0])
-				|| IsNewline(text[text.size() - 1]);
-		}();
-		const auto rightForBlock = [&] {
-			auto cursor = QTextCursor(document());
-			cursor.movePosition(QTextCursor::End);
-			if (till >= cursor.position()) {
-				return true;
-			}
-			const auto text = getTextWithTagsPart(
-				till - 1,
-				till + 1
-			).text;
-			return text.isEmpty()
-				|| IsNewline(text[0])
-				|| IsNewline(text[text.size() - 1]);
-		}();
-
-		const auto useTag = (tag != kTagCode)
-			? tag
-			: (leftForBlock && rightForBlock)
-			? kTagPre
-			: kTagCode;
-		range = addMarkdownTag(range, useTag);
+		const auto useTag = selectionMarkdownTagForToggle(tag);
+		if (useTag.isEmpty()) {
+			return;
+		} else if (HasFullTextTag(getTextWithTagsSelected(), useTag)) {
+			removeMarkdownTag(range, useTag);
+		} else {
+			range = addMarkdownTag(range, useTag);
+		}
 	}
 	auto restorePosition = textCursor();
 	restorePosition.setPosition(
@@ -5519,21 +5767,53 @@ bool InputField::jumpOutOfBlockByBackspace() {
 	return true;
 }
 
-void InputField::contextMenuEventInner(
-		QContextMenuEvent *e,
-		QMenu *m,
-		Fn<void(not_null<PopupMenu*>)> setupPopupMenu) {
-	if (const auto menu = m ? m : _inner->createStandardContextMenu()) {
-		addMarkdownActions(menu, e);
+void InputField::contextMenuEventInner(QContextMenuEvent *e) {
+	const auto menu = _inner->createStandardContextMenu();
+	if (!menu) {
+		return;
+	}
+	addMarkdownActions(menu, e);
+
+	// The menu may be shown asynchronously: a hook (spell checking) can defer
+	// the show until its async work finishes. We keep a single shared barrier
+	// and show exactly one PopupMenu once every deferral has completed.
+	struct State {
+		int pending = 1;
+		std::vector<Fn<void(not_null<PopupMenu*>)>> setups;
+	};
+	const auto state = std::make_shared<State>();
+	const auto globalPos = e->globalPos();
+	const auto show = crl::guard(this, [=] {
 		_contextMenu = base::make_unique_q<PopupMenu>(this, menu, _st.menu);
-		if (setupPopupMenu) {
-			setupPopupMenu(_contextMenu.get());
+		for (const auto &setup : state->setups) {
+			setup(_contextMenu.get());
 		}
 		QObject::connect(_contextMenu.get(), &QObject::destroyed, [=] {
 			_menuShownChanges.fire(false);
 		});
 		_menuShownChanges.fire(true);
-		_contextMenu->popup(e->globalPos());
+		_contextMenu->popup(globalPos);
+	});
+	auto request = ContextMenuRequest{
+		.menu = menu,
+		.event = e,
+		.customizePopupMenu = [=](Fn<void(not_null<PopupMenu*>)> setup) {
+			state->setups.push_back(std::move(setup));
+		},
+		.awaitAsyncWork = [=]() -> Fn<void()> {
+			++state->pending;
+			return [=] {
+				if (!--state->pending) {
+					show();
+				}
+			};
+		},
+	};
+	for (const auto &hook : _contextMenuHooks) {
+		hook(request);
+	}
+	if (!--state->pending) {
+		show();
 	}
 }
 
